@@ -1826,7 +1826,14 @@ void Tracking::ResetFrameIMU()
     // TODO To implement...
 }
 
-
+/**
+* @brief Tracking process, including constant speed model tracking, reference keyframe tracking, local map tracking
+* Track consists of two parts: estimating motion and tracking local maps.
+*
+* Step 1: Initialization
+* Step 2: Tracking
+* Step 3: Record pose information for track reproduction
+*/
 void Tracking::Track()
 {
 
@@ -1838,6 +1845,7 @@ void Tracking::Track()
         mbStep = false;
     }
 
+    // Step 1 Reset the current active map if the IMU is considered to be a problem in the local map.
     if(mpLocalMapper->mbBadImu)
     {
         cout << "TRACK: Reset map because local mapper set the bad imu flag " << endl;
@@ -1845,19 +1853,23 @@ void Tracking::Track()
         return;
     }
 
+    // Extract the current active map from Atlas
     Map* pCurrentMap = mpAtlas->GetCurrentMap();
     if(!pCurrentMap)
     {
         cout << "ERROR: There is not an active map in the atlas" << endl;
     }
 
+    // Step 2 Handling timestamp exceptions
     if(mState!=NO_IMAGES_YET)
     {
         if(mLastFrame.mTimeStamp>mCurrentFrame.mTimeStamp)
         {
+            // If the current image timestamp is less than the previous frame timestamp, indicate that something went wrong, clear imu data, and create a new submap.
             cerr << "ERROR: Frame with a timestamp older than previous frame detected!" << endl;
             unique_lock<mutex> lock(mMutexImuQueue);
             mlQueueImuData.clear();
+            // Create a new map
             CreateMapInAtlas();
             return;
         }
@@ -1865,23 +1877,29 @@ void Tracking::Track()
         {
             // cout << mCurrentFrame.mTimeStamp << ", " << mLastFrame.mTimeStamp << endl;
             // cout << "id last: " << mLastFrame.mnId << "    id curr: " << mCurrentFrame.mnId << endl;
+            // If the current image timestamp and the previous frame image timestamp are greater than 1s, the timestamp obviously jumps, reset the map and return directly.
+            //compensate imu according to whether imu mode is imu mode or not
             if(mpAtlas->isInertial())
             {
-
+                // If the current map imu is successfully initialized
                 if(mpAtlas->isImuInitialized())
                 {
                     cout << "Timestamp jump detected. State set to LOST. Reseting IMU integration..." << endl;
+                    // IMU completes 3rd initialization (in the localmapping thread)
                     if(!pCurrentMap->GetIniertialBA2())
                     {
+                        // If imu in the current subgraph does not go through BA2, reset the active map, that is, the previous data is no longer required.
                         mpSystem->ResetActiveMap();
                     }
                     else
                     {
+                        // If imu in the current subgraph is BA2, re-create the new subgraph and save the current map
                         CreateMapInAtlas();
                     }
                 }
                 else
                 {
+                    // If imu is not initialized in the current subgraph, reset the active map
                     cout << "Timestamp jump detected, before IMU initialization. Reseting..." << endl;
                     mpSystem->ResetActiveMap();
                 }
@@ -1891,7 +1909,7 @@ void Tracking::Track()
         }
     }
 
-
+    // Step 3 Set the Bias parameters of the IMU in IMU mode and ensure that the previous frame exists
     if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && mpLastKeyFrame)
         mCurrentFrame.SetNewBias(mpLastKeyFrame->GetImuBias());
 
@@ -1901,12 +1919,13 @@ void Tracking::Track()
     }
 
     mLastProcessedState=mState;
-
+    // Step 4 Preintegrate IMU data in IMU mode without creating a map
     if ((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && !mbCreatedMap)
     {
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartPreIMU = std::chrono::steady_clock::now();
 #endif
+        // Preintegration of IMU data
         PreintegrateIMU();
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_EndPreIMU = std::chrono::steady_clock::now();
@@ -1919,27 +1938,34 @@ void Tracking::Track()
     mbCreatedMap = false;
 
     // Get Map Mutex -> Map cannot be changed
+    // Lock the map when it is updated. Make sure the map doesn't change.
+    // Q: Does this affect the real-time update of the map?
+    // Answer: It takes a lot of time to extract and match feature points in the construction frame, when the map is unlocked and there is enough time to update the map.
     unique_lock<mutex> lock(pCurrentMap->mMutexMapUpdate);
 
     mbMapUpdated = false;
 
+    // Determine if the map ID has been updated.
     int nCurMapChangeIndex = pCurrentMap->GetMapChangeIndex();
     int nMapChangeIndex = pCurrentMap->GetLastMapChange();
     if(nCurMapChangeIndex>nMapChangeIndex)
     {
+        // Map updated detected.
         pCurrentMap->SetLastMapChange(nCurMapChangeIndex);
         mbMapUpdated = true;
     }
 
-
+    // Step 5 Initialization
     if(mState==NOT_INITIALIZED)
     {
         if(mSensor==System::STEREO || mSensor==System::RGBD || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD)
         {
+            // A Shared Function for Initializing Binocular RGBD Cameras
             StereoInitialization();
         }
         else
         {
+            // monocular initialization
             MonocularInitialization();
         }
 
@@ -1947,18 +1973,21 @@ void Tracking::Track()
 
         if(mState!=OK) // If rightly initialized, mState=OK
         {
+            // If not successfully initialized, return directly.
             mLastFrame = Frame(mCurrentFrame);
             return;
         }
 
         if(mpAtlas->GetAllMaps().size() == 1)
         {
+            // If the current map is the first map, record the current frame id as the first frame.
             mnFirstFrameId = mCurrentFrame.mnId;
         }
     }
     else
     {
         // System is initialized. Track Frame.
+        // Step 6 The system is successfully initialized, and the following is the specific tracking process
         bool bOK;
 
 #ifdef REGISTER_TIMES
@@ -1966,18 +1995,28 @@ void Tracking::Track()
 #endif
 
         // Initial camera pose estimation using motion model or relocalization (if tracking is lost)
+        // mbOnlyTracking equals false for normal SLAM mode (localization + map update), mbOnlyTracking equals true for localization mode only
+        // The tracking class is constructed with false by default. In the viewer, there is a switch ActivateLocalizationMode, which can control whether to turn on mbOnlyTracking
         if(!mbOnlyTracking)
         {
 
             // State OK
             // Local Mapping is activated. This is the normal behaviour, unless
             // you explicitly activate the "only tracking" mode.
+            // Track into normal SLAM mode with map updates
+
+            // If normally followed.
             if(mState==OK)
             {
 
                 // Local Mapping might have changed some MapPoints tracked in last frame
+                // The local mapping thread may replace the original map point.Check here.
                 CheckReplacedInLastFrame();
 
+                // Step 6.2 The motion model is empty and imu is uninitialized or has just completed the relocation, tracking the reference keyframe; otherwise constant speed model tracking
+                // The first condition, if the motion model is empty and imu is not initialized, is that the first frame trace has just started, or has been lost.
+                // The second condition is that if the current frame follows the rearranged frame closely, we use the rearranged frame to restore the position.
+                // mnLastRelocFrameId The frame that was last repositioned
                 if((!mbVelocity && !pCurrentMap->isImuInitialized()) || mCurrentFrame.mnId<mnLastRelocFrameId+2)
                 {
                     Verbose::PrintMess("TRACK: Track with respect to the reference KF ", Verbose::VERBOSITY_DEBUG);
@@ -1986,14 +2025,23 @@ void Tracking::Track()
                 else
                 {
                     Verbose::PrintMess("TRACK: Track with motion model", Verbose::VERBOSITY_DEBUG);
+                    // Tracking with a constant speed model.The so-called constant speed is assumed to be the position of the upper frame to the previous frame = the position of the previous frame to the current frame.
+                    // Set the initial position of the current frame according to the constant speed model, and track the current normal frame with the nearest normal frame.
+                    // Find the matching point of the feature point of the current frame in the reference frame by projection, optimize the projection error of each feature point corresponding to the 3D point to obtain the position position.
                     bOK = TrackWithMotionModel();
                     if(!bOK)
+                        // According to the constant speed model failed and can only be tracked based on the reference keyframe.
                         bOK = TrackReferenceKeyFrame();
                 }
 
-
+                // Added a status RECENTLY_LOST, mainly combined with IMU to see if it can be pulled back
+                // Step 6.3 If the tracking reference key frame and constant speed model tracking fail, and certain conditions are met, it is marked as RECENTLY_LOST or LOST.
                 if (!bOK)
                 {
+                    // Condition 1: If the current frame distance is less than 1s from the last reset.
+                    // MnFramesToResetIMU indicates how many frames can be reset after IMU, generally set to the same frame rate, the corresponding time is 1s
+                    // Condition 2: Monocular + IMU or binocular + IMU mode
+                    // Conditions 1, 2 are also met, and the label is LOST.
                     if ( mCurrentFrame.mnId<=(mnLastRelocFrameId+mnFramesToResetIMU) &&
                          (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor == System::IMU_RGBD))
                     {
@@ -2002,7 +2050,11 @@ void Tracking::Track()
                     else if(pCurrentMap->KeyFramesInMap()>10)
                     {
                         // cout << "KF in map: " << pCurrentMap->KeyFramesInMap() << endl;
+                        // Condition 1: The number of keyframes in the current map is large (greater than 10)
+                        // Condition 2 (hidden condition): The current frame is more than 1s away from the last reset frame (the explanation is more competitive, the value of the rescue) or non-IMU mode
+                        // At the same time, if conditions 1, 2, the status is marked RECENTLY_LOST, and the position predicted by IMU will be combined to see if it can be pulled back.
                         mState = RECENTLY_LOST;
+                        // Record Lost Time
                         mTimeStampLost = mCurrentFrame.mTimeStamp;
                     }
                     else
@@ -2011,21 +2063,25 @@ void Tracking::Track()
                     }
                 }
             }
-            else
+            else    // Tracking is not normal, follow the below processing
             {
-
+                // If it is RECENTLY_LOST state
                 if (mState == RECENTLY_LOST)
                 {
                     Verbose::PrintMess("Lost for a short time", Verbose::VERBOSITY_NORMAL);
-
+                    // bok is set to true.
                     bOK = true;
                     if((mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))
                     {
+                        // IMU mode can be used to predict posture, see if it can be pulled back
+                        // Step 6.4 If the IMU in the current map has been successfully initialized, use the IMU data to predict the posture.
                         if(pCurrentMap->isImuInitialized())
                             PredictStateIMU();
                         else
                             bOK = false;
 
+                        // If the current frame distance in IMU mode exceeds 5s and the frame is not recovered (time_recently_lost defaults to 5s)
+                        // Change the RECENTLY_LOST state to LOST
                         if (mCurrentFrame.mTimeStamp-mTimeStampLost>time_recently_lost)
                         {
                             mState = LOST;
@@ -2035,30 +2091,36 @@ void Tracking::Track()
                     }
                     else
                     {
+                        // Step 6.5 The pure visual mode is repositioned.Mainly BOW search, EPnP solution position
                         // Relocalization
                         bOK = Relocalization();
                         //std::cout << "mCurrentFrame.mTimeStamp:" << to_string(mCurrentFrame.mTimeStamp) << std::endl;
                         //std::cout << "mTimeStampLost:" << to_string(mTimeStampLost) << std::endl;
                         if(mCurrentFrame.mTimeStamp-mTimeStampLost>3.0f && !bOK)
                         {
+                            // Reset failed in pure visual mode, status LOST
                             mState = LOST;
                             Verbose::PrintMess("Track Lost...", Verbose::VERBOSITY_NORMAL);
                             bOK=false;
                         }
                     }
                 }
-                else if (mState == LOST)
+                else if (mState == LOST)    // The previous frame was recently lost and the reset failed.
                 {
-
+                    // Step 6.6 If it is a LOST state
+                    // Open a new map
                     Verbose::PrintMess("A new map is started...", Verbose::VERBOSITY_NORMAL);
 
                     if (pCurrentMap->KeyFramesInMap()<10)
                     {
+                        // The number of keyframes in the current map is less than 10, reset the current map
                         mpSystem->ResetActiveMap();
                         Verbose::PrintMess("Reseting current map...", Verbose::VERBOSITY_NORMAL);
                     }else
+                        // The number of keyframes in the current map exceeds 10, create a new map
                         CreateMapInAtlas();
 
+                    // Kill the last keyframe.
                     if(mpLastKeyFrame)
                         mpLastKeyFrame = static_cast<KeyFrame*>(NULL);
 
@@ -2069,26 +2131,34 @@ void Tracking::Track()
             }
 
         }
-        else
+        else    // pure localization mode
         {
             // Localization Mode: Local Mapping is deactivated (TODO Not available in inertial mode)
+            // Tracking only, local map does not work
             if(mState==LOST)
             {
                 if(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
                     Verbose::PrintMess("IMU. State LOST", Verbose::VERBOSITY_NORMAL);
+                // Step 6.1 Reset the LOST state
                 bOK = Relocalization();
             }
             else
             {
+                // mbVO is a variable when mbOnlyTracking is true.
+                // mbVO false indicates that this frame matches a lot of MapPoints, tracking is normal (note that it is a little counterintuitive)
+                // mbVO true indicates that this frame matches very few MapPoints, less than 10, to be dropped
                 if(!mbVO)
                 {
                     // In last frame we tracked enough MapPoints in the map
+                    // Step 6.2 If the tracking status is normal, use a constant speed model or reference keyframe tracking
                     if(mbVelocity)
                     {
+                        // Preferred use of constant speed model tracking
                         bOK = TrackWithMotionModel();
                     }
                     else
                     {
+                        // If the constant speed model is not satisfied, then it can only be tracked by reference to the keyframe
                         bOK = TrackReferenceKeyFrame();
                     }
                 }
@@ -2100,32 +2170,49 @@ void Tracking::Track()
                     // If relocalization is sucessfull we choose that solution, otherwise we retain
                     // the "visual odometry" solution.
 
+                    // mbVO is true, indicating that the frame matches few (less than 10) map points, to follow the rhythm of the loss, both tracking and repositioning
+
+                    // MM=Motion Model, the result of tracking by motion model
                     bool bOKMM = false;
+                    // Results tracked by repositioning method
                     bool bOKReloc = false;
+
+                    // Map points constructed in motion models
                     vector<MapPoint*> vpMPsMM;
+                    // Outliers found after tracking motion models
                     vector<bool> vbOutMM;
+                    // position obtained by the motion model
                     Sophus::SE3f TcwMM;
+                    // Step 6.3 When the motion model is valid, calculate the posture based on the motion model
                     if(mbVelocity)
                     {
                         bOKMM = TrackWithMotionModel();
+                        // Temporarily store the results of the constant-speed model trace in these variables, because later repositioning changes these variables
                         vpMPsMM = mCurrentFrame.mvpMapPoints;
                         vbOutMM = mCurrentFrame.mvbOutlier;
                         TcwMM = mCurrentFrame.GetPose();
                     }
+                    // Step 6.4 Use the repositioning method to get the position of the current frame
                     bOKReloc = Relocalization();
 
+                    // Step 6.5 Update the status based on the previous constant speed model and relocation results
                     if(bOKMM && !bOKReloc)
                     {
+                        // Constant-speed model success, reset failed, reuse previously temporarily stored constant-speed model results
                         mCurrentFrame.SetPose(TcwMM);
                         mCurrentFrame.mvpMapPoints = vpMPsMM;
                         mCurrentFrame.mvbOutlier = vbOutMM;
 
+                        // If the current frame matches very few 3D points, increase the number of observations of the current visual map point
                         if(mbVO)
                         {
+                            // Update the number of times the map point of the current frame is found, pay attention to the number of observations, these are two concepts
                             for(int i =0; i<mCurrentFrame.N; i++)
                             {
+                                // If this feature point forms a map point, and it's not an outer point,
                                 if(mCurrentFrame.mvpMapPoints[i] && !mCurrentFrame.mvbOutlier[i])
                                 {
+                                    // Increase the number of times found
                                     mCurrentFrame.mvpMapPoints[i]->IncreaseFound();
                                 }
                             }
@@ -2133,14 +2220,18 @@ void Tracking::Track()
                     }
                     else if(bOKReloc)
                     {
+                        // As long as the re-location is successful, the whole tracking process is carried out normally (re-location and tracking, more believe in re-location)
                         mbVO = false;
                     }
 
+                    // If there is a success, we think the implementation is successful.
                     bOK = bOKReloc || bOKMM;
                 }
             }
         }
 
+        // Use the latest keyframe as the reference keyframe for the current frame
+        // mpReferenceKF is first the reference key frame at the last moment, if the current key frame is new, it becomes the current key frame, if not the new key frame, first the reference key frame of the previous frame, and then after updating the local key frame.
         if(!mCurrentFrame.mpReferenceKF)
             mCurrentFrame.mpReferenceKF = mpReferenceKF;
 
@@ -2155,11 +2246,19 @@ void Tracking::Track()
 #ifdef REGISTER_TIMES
         std::chrono::steady_clock::time_point time_StartLMTrack = std::chrono::steady_clock::now();
 #endif
+
+        // Step 7 After tracking the initial posture of the current frame, trace the local map to get more matches and optimize the current posture.
+        // The front just tracks a frame to get the initial position, here search for local keyframes, local map points, and the current frame for projection matching, get more matching MapPoints after Pose optimization
+        // After matching between frames to get the initial posture, now trace the local map to get more matching, and optimize the current posture.
+        // local map: current frame, current frame MapPoints, current key frame and other key frame co-view relationship
+        // The front is mainly two tracks (constant speed model tracks the previous frame,Tracking reference frames), where all local MapPoints are collected after searching for local keyframes,
+        // Then local MapPoints and the current frame projection matching, get more matching MapPoints after Pose optimization
         // If we have an initial estimation of the camera pose and matching. Track the local map.
         if(!mbOnlyTracking)
         {
             if(bOK)
             {
+                // Local Map Tracking
                 bOK = TrackLocalMap();
 
             }
@@ -2174,16 +2273,37 @@ void Tracking::Track()
             if(bOK && !mbVO)
                 bOK = TrackLocalMap();
         }
+        // This is the end of the tracking positioning phase, so let's start the finishing work and prepare for the next frame.
 
+        // Check the two state changes at this point.
+        // bOK historical changes --- the previous frame tracking success --- the current frame tracking success --- the local map tracking success --- true --> OK 1 The local map tracking success
+        //  \                                                         \                                        \--- Local map tracking failed---false
+        //   \                                                         \--- Current frame tracking failed --- false
+        //    \---Previous frame tracking failure---Reset successful---Local map tracking successful---true -->OK 2 Reset
+        //                                    \                    \--- Local map tracking failed---false
+        //                                     \--- Failed to reset --- false
+
+        //
+        // mState history change---Previous frame tracking successful---Current frame tracking successful---Local map tracking successful---OK -->OK 1 Tracking local map successful
+        //   \                           \                                                              \---Local map tracking failed-----OK -->OK 3 Normal tracking
+        //    \                           \--- Current frame tracking failed - not OK
+        //     \---Previous frame tracking failure---Reset successful---Local map tracking successful---Non-OK
+        //               \                                         \---Local map tracking failed---Non-OK
+        //                \---Reset failed-----Non-OK (can't be reached here because it's directly returned)
+        // The condition that the current frame status is OK is that the tracking local map is successful, and the reset or normal tracking can be carried out.
+        // Step 8 Based on the above actions, determine whether the tracking is successful.
         if(bOK)
+            // Okay, that's when the tracking was successful.
             mState = OK;
-        else if (mState == OK)
+        else if (mState == OK)  // As can be seen from the above graph, it is only performed when the first phase tracking is successful, but the second phase local map tracking fails.
         {
+            // Status changed to recently lost
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
             {
                 Verbose::PrintMess("Track lost for less than one second...", Verbose::VERBOSITY_NORMAL);
                 if(!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())
                 {
+                    // Reset the current map if the IMU in IMU mode has not been successfully initialized or the IMU BA has not been completed.
                     cout << "IMU is not or recently initialized. Reseting active map..." << endl;
                     mpSystem->ResetActiveMap();
                 }
@@ -2191,8 +2311,9 @@ void Tracking::Track()
                 mState=RECENTLY_LOST;
             }
             else
-                mState=RECENTLY_LOST; // visual to lost
+                mState=RECENTLY_LOST; // Previous version here directly determines the loss LOST
 
+            // Remarked. Recorded lost time.
             /*if(mCurrentFrame.mnId>mnLastRelocFrameId+mMaxFrames)
             {*/
                 mTimeStampLost = mCurrentFrame.mTimeStamp;
@@ -2200,6 +2321,7 @@ void Tracking::Track()
         }
 
         // Save frame if recent relocalization, since they are used for IMU reset (as we are making copy, it shluld be once mCurrFrame is completely modified)
+        // It doesn't seem to work.
         if((mCurrentFrame.mnId<(mnLastRelocFrameId+mnFramesToResetIMU)) && (mCurrentFrame.mnId > mnFramesToResetIMU) &&
            (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD) && pCurrentMap->isImuInitialized())
         {
@@ -2212,16 +2334,19 @@ void Tracking::Track()
             pF->mpImuPreintegratedFrame = new IMU::Preintegrated(mCurrentFrame.mpImuPreintegratedFrame);
         }
 
+        // The code below is useless.
         if(pCurrentMap->isImuInitialized())
         {
             if(bOK)
             {
+                // The current frame distance is exactly 1s from the last reset frame, reset (TODO has not been implemented)
                 if(mCurrentFrame.mnId==(mnLastRelocFrameId+mnFramesToResetIMU))
                 {
                     cout << "RESETING FRAME!!!" << endl;
                     ResetFrameIMU();
                 }
                 else if(mCurrentFrame.mnId>(mnLastRelocFrameId+30))
+                    // It's no use. It'll be re-assigned and passed to the normal frame.
                     mLastBias = mCurrentFrame.mImuBias;
             }
         }
@@ -2234,27 +2359,50 @@ void Tracking::Track()
 #endif
 
         // Update drawer
+        // Update information about images, feature points, map points, etc. in the display thread
         mpFrameDrawer->Update(this);
         if(mCurrentFrame.isSet())
             mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
 
+        // Check the two state changes at this point.
+        // bOK historical change --- the previous frame tracking successful --- the current frame tracking successful --- the local map tracking successful --- true
+        //      \                               \                                                                   \ --- Local map tracking failed---false
+        //       \                               \---Current frame tracking failed --- false
+        //        \---Previous frame tracking failure---Reset successful---Local map tracking successful---true
+        //              \                                              \---Local map tracking failed---false
+        //               \--- Failed to reset --- false
+
+        // mState historical changes --- Previous frame tracking successful --- Current frame tracking successful --- Local map tracking successful --- OK
+        //       \                              \                                                               \ --- Local map tracking failed---Non-OK (RECENTLY_LOST in IMU)
+        //        \                              \--- Current frame tracking failed——Non-OK (RecENTLY_LOST when map has more than 10 keyframes)
+        //         \---Recently_LOST---Reset Successful --- Local Map Tracking Successful---OK
+        //          \            \                    \ --- Local map tracking failed - LOST
+        //           \            \ --- Reset failed --- LOST (can't be passed here because it's directly returned)
+        //            \--- Last frame tracking failed (LOST) --- LOST (can't be passed here because it's directly returned)
+
+        // Step 9 Update speed, clear invalid map points, and create keyframes as needed if tracking is successful or recently lost
         if(bOK || mState==RECENTLY_LOST)
         {
             // Update motion model
+            // Step 9.1 Update mVelocity in TrackWithMotionModel
             if(mLastFrame.isSet() && mCurrentFrame.isSet())
             {
                 Sophus::SE3f LastTwc = mLastFrame.GetPose().inverse();
+                // mVelocity = Tcl = Tcw * Twl, which represents the transformation from the previous frame to the current frame, where Twl = LastTwc
                 mVelocity = mCurrentFrame.GetPose() * LastTwc;
                 mbVelocity = true;
             }
             else {
+                // Otherwise, there is no speed.
                 mbVelocity = false;
             }
 
+            // Position display using IMU integration
             if(mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
                 mpMapDrawer->SetCurrentCameraPose(mCurrentFrame.GetPose());
 
             // Clean VO matches
+            // Step 9.2 Clearing Unobserved Map Points
             for(int i=0; i<mCurrentFrame.N; i++)
             {
                 MapPoint* pMP = mCurrentFrame.mvpMapPoints[i];
@@ -2267,22 +2415,34 @@ void Tracking::Track()
             }
 
             // Delete temporal MapPoints
+            // Step 9.3 Clear MapPoints temporarily added for the current frame in UpdateLastFrame in constant-speed model tracking (binaugular and rgbd only)
+            // In the previous step, these MapPoints were simply excluded from the current frame, which is removed from the MapPoints database here.
+            // Temporary map points are only used to improve the frame tracking effect of binocular or rgbd cameras, and are thrown away after use, not added to the map.
             for(list<MapPoint*>::iterator lit = mlpTemporalPoints.begin(), lend =  mlpTemporalPoints.end(); lit!=lend; lit++)
             {
                 MapPoint* pMP = *lit;
                 delete pMP;
             }
+            // Here is not only to clear mlpTemporalPoints, but also delete the pointer to MapPoint via delete pMP
+            // This cannot be done directly because it stores pointers, and previous operations have been done to avoid memory leaks.
             mlpTemporalPoints.clear();
 
 #ifdef REGISTER_TIMES
             std::chrono::steady_clock::time_point time_StartNewKF = std::chrono::steady_clock::now();
 #endif
+            // Determine if keyframes need to be inserted
             bool bNeedKF = NeedNewKeyFrame();
 
             // Check if we need to insert a new keyframe
             // if(bNeedKF && bOK)
+
+            // Step 9.4 Determining whether to insert a keyframe based on conditions
+            // The following conditions must be met at the same time:
+            // Condition 1: bNeedKF=true, need to insert keyframe
+            // Condition 2: bOK=true tracking successful or RECENTLY_LOST mode in IMU mode and mInsertKFsLost is true
             if(bNeedKF && (bOK || (mInsertKFsLost && mState==RECENTLY_LOST &&
                                    (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD))))
+                // Create keyframes that generate new map points for binoculars or RGB-D
                 CreateNewKeyFrame();
 
 #ifdef REGISTER_TIMES
@@ -2296,6 +2456,11 @@ void Tracking::Track()
             // pass to the new keyframe, so that bundle adjustment will finally decide
             // if they are outliers or not. We don't want next frame to estimate its position
             // with those points so we discard them in the frame. Only has effect if lastframe is tracked
+
+            // The author here says that allowing new keyframes in BA that are judged as outliers by the Huber kernel allows subsequent BA's to judge whether they are really outliers or not.
+            // But we don't want to use these outliers when estimating the next position, so we delete them.
+
+            // Step 9.5 Remove map points detected as outliers in BA
             for(int i=0; i<mCurrentFrame.N;i++)
             {
                 if(mCurrentFrame.mvpMapPoints[i] && mCurrentFrame.mvbOutlier[i])
@@ -2304,9 +2469,11 @@ void Tracking::Track()
         }
 
         // Reset if the camera get lost soon after initialization
+        // Step 10 If the second phase of tracking fails, the tracking status is LOST.
         if(mState==LOST)
         {
-            if(pCurrentMap->KeyFramesInMap()<=10)
+            // If the keyframe in the map is less than 10, reset the current map and exit the current trace
+            if(pCurrentMap->KeyFramesInMap()<=10)   // Previous version here is 5.
             {
                 mpSystem->ResetActiveMap();
                 return;
@@ -2314,30 +2481,44 @@ void Tracking::Track()
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
                 if (!pCurrentMap->isImuInitialized())
                 {
+                    // If it is IMU mode and IMU initialization has not been performed, reset the current map and exit the current trace.
                     Verbose::PrintMess("Track lost before IMU initialisation, reseting...", Verbose::VERBOSITY_QUIET);
                     mpSystem->ResetActiveMap();
                     return;
                 }
-
+            // If the map has more than 10 keyframes and is in pure visual mode or IMU mode but IMU initialization has been completed, save the current map and create a new map.
             CreateMapInAtlas();
 
+            // A new return has been added.
             return;
         }
 
+        // Make sure the reference key is set
         if(!mCurrentFrame.mpReferenceKF)
             mCurrentFrame.mpReferenceKF = mpReferenceKF;
-
+        // Save the data from the previous frame and change the current frame to the previous frame
         mLastFrame = Frame(mCurrentFrame);
     }
 
 
 
-
+    // Find out so far.
+    // mState historical changes --- Previous frame tracking successful --- Current frame tracking successful --- Local map tracking successful --- OK
+    //      \                                                   \                                            \---Local map tracking failed---Non-OK (RECENTLY_LOST in IMU)
+    //       \                                                   \ --- Current frame tracking failed——Non-OK (RecENTLY_LOST when map has more than 10 keyframes)
+    //        \---Recently_LOST---Reset Successful---Local Map Tracking Successful---OK
+    //         \             \                  \ --- Local map tracking failed - LOST
+    //          \             \ --- Reset failed --- LOST (can't be passed here because it's directly returned)
+    //           \ --- Last frame tracking failed (LOST) -- LOST (can't be passed here because it's directly returned)
+    // // last.Record posture information for track reproduction
+    // Step 11 Record posture information to save all tracks at the end.
     if(mState==OK || mState==RECENTLY_LOST)
     {
         // Store frame pose information to retrieve the complete camera trajectory afterwards.
+        // Step 11: Record posture information to save all tracks at the end
         if(mCurrentFrame.isSet())
         {
+            // Calculate the relative attitude Tcr = Tcw * Twr, Twr = Trw^-1
             Sophus::SE3f Tcr_ = mCurrentFrame.GetPose() * mCurrentFrame.mpReferenceKF->GetPoseInverse();
             mlRelativeFramePoses.push_back(Tcr_);
             mlpReferences.push_back(mCurrentFrame.mpReferenceKF);
@@ -2347,6 +2528,7 @@ void Tracking::Track()
         else
         {
             // This can happen if tracking is lost
+            // If tracking fails, the previous value is used for the relative posture
             mlRelativeFramePoses.push_back(mlRelativeFramePoses.back());
             mlpReferences.push_back(mlpReferences.back());
             mlFrameTimes.push_back(mlFrameTimes.back());
